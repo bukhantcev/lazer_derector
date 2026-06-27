@@ -132,31 +132,31 @@ class PlanView(QGraphicsView):
             self.scene.removeItem(self._target_label_bg)
         x = x_mm / self.mm_per_scene_unit
         y = y_mm / self.mm_per_scene_unit
-        radius = max(8, 100 / self.mm_per_scene_unit)
-        self._target_marker = self.scene.addEllipse(x - radius, -y - radius, radius * 2, radius * 2, QPen(QColor("#ff4d6d"), 0), QBrush(QColor(255, 77, 109, 80)))
+        self._target_marker = self.scene.addEllipse(-7, -7, 14, 14, QPen(QColor("#ff4d6d"), 2), QBrush(QColor(255, 77, 109, 90)))
+        self._target_marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        self._target_marker.setZValue(9997)
+        self._target_marker.setPos(x, -y)
         self._add_target_label(x, -y, x_mm, y_mm)
 
     def _add_target_label(self, scene_x: float, scene_y: float, x_mm: float, y_mm: float) -> None:
-        scale = max(self.mm_per_scene_unit, 0.0001)
         text = f"X {x_mm:.0f} mm\nY {y_mm:.0f} mm"
         self._target_label = QGraphicsSimpleTextItem(text)
         self._target_label.setBrush(QBrush(QColor("#f5f7fb")))
         self._target_label.setFont(QFont("Arial", 11))
-        item_scale = max(0.12, min(1.0, 1 / scale))
-        self._target_label.setScale(item_scale)
-        margin = 8 * item_scale
-        offset_x = max(18, 160 / scale)
-        offset_y = -max(22, 120 / scale)
-        label_x = scene_x + offset_x
-        label_y = scene_y + offset_y
+        self._target_label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        margin = 8
+        label_x = scene_x + 16
+        label_y = scene_y - 42
         self._target_label.setPos(label_x + margin, label_y + margin)
 
-        rect = self._target_label.sceneBoundingRect().adjusted(-margin, -margin, margin, margin)
+        rect = self._target_label.boundingRect().adjusted(-margin, -margin, margin, margin)
         path = QPainterPath()
-        path.addRoundedRect(rect, 6 * item_scale, 6 * item_scale)
+        path.addRoundedRect(rect, 6, 6)
         self._target_label_bg = QGraphicsPathItem(path)
         self._target_label_bg.setBrush(QBrush(QColor(18, 24, 32, 230)))
-        self._target_label_bg.setPen(QPen(QColor("#ff4d6d"), 0))
+        self._target_label_bg.setPen(QPen(QColor("#ff4d6d"), 1))
+        self._target_label_bg.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        self._target_label_bg.setPos(label_x + margin, label_y + margin)
         self._target_label_bg.setZValue(9998)
         self._target_label.setZValue(9999)
         self.scene.addItem(self._target_label_bg)

@@ -79,6 +79,26 @@ class FixtureConfig:
 
 
 @dataclass
+class FixtureGeometry:
+    enabled: bool = True
+    head_x_mm: float = 0
+    head_y_mm: float = -3000
+    head_z_mm: float = 3000
+    target_z_mm: float = 0
+    pan_range_deg: float = 540
+    tilt_range_deg: float = 270
+    yaw_deg: float = 0
+    pitch_deg: float = 0
+    roll_deg: float = 0
+    pan_center: float = 32768
+    tilt_center: float = 32768
+    pan_sign: int = 1
+    tilt_sign: int = 1
+    fit_error_mm: float | None = None
+    fitted: bool = False
+
+
+@dataclass
 class PdfScale:
     p1_scene: tuple[float, float] | None = None
     p2_scene: tuple[float, float] | None = None
@@ -91,6 +111,7 @@ class Project:
     coordinate_units: str = "mm"
     y_direction: str = "depth"
     fixture: FixtureConfig = field(default_factory=FixtureConfig)
+    geometry: FixtureGeometry = field(default_factory=FixtureGeometry)
     calibration: list[CalibrationSample] = field(default_factory=list)
     objects: list[PlanObject] = field(default_factory=list)
     plan_path: str | None = None
@@ -100,6 +121,7 @@ class Project:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Project":
         fixture = FixtureConfig(**data.get("fixture", {}))
+        geometry = FixtureGeometry(**data.get("geometry", {}))
         calibration = [CalibrationSample(**item) for item in data.get("calibration", [])]
         objects = [PlanObject(**item) for item in data.get("objects", [])]
         pdf_scale = PdfScale(**data.get("pdf_scale", {}))
@@ -108,6 +130,7 @@ class Project:
             coordinate_units=data.get("coordinate_units", "mm"),
             y_direction=data.get("y_direction", "depth"),
             fixture=fixture,
+            geometry=geometry,
             calibration=calibration,
             objects=objects,
             plan_path=data.get("plan_path"),

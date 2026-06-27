@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDockWidget,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QToolBar,
     QVBoxLayout,
@@ -31,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from .artnet import ArtNetSender
-from .calibration import CalibrationModel
+from .calibration import CalibrationModel, fit_geometric_model
 from .dmx_fixture import DmxFixture
 from .models import CalibrationSample, FixtureConfig, PlanObject, Project
 from .plan_view import PlanView
@@ -68,8 +70,9 @@ class CalibrationWizardDialog(QDialog):
         self._syncing = False
 
         self.setWindowTitle("Calibration Wizard")
-        self.resize(760, 560)
+        self.resize(720, 520)
         self._build_ui()
+        self._fit_to_screen()
         self._populate_points()
         self._select_index(0)
 
@@ -79,8 +82,12 @@ class CalibrationWizardDialog(QDialog):
         header.setStyleSheet("font-size: 20px; font-weight: 700;")
         root.addWidget(header)
 
-        body = QHBoxLayout()
-        root.addLayout(body, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        scroll.setWidget(content)
+        body = QHBoxLayout(content)
+        root.addWidget(scroll, 1)
 
         left = QVBoxLayout()
         self.point_list = QListWidget()
@@ -125,6 +132,27 @@ class CalibrationWizardDialog(QDialog):
         values_form.addRow("Pan", self.pan_spin)
         values_form.addRow("Tilt", self.tilt_spin)
         right.addWidget(values_box)
+
+        geometry_box = QGroupBox("Auto geometry")
+        geometry_form = QFormLayout(geometry_box)
+        self.pan_range_spin = QDoubleSpinBox()
+        self.pan_range_spin.setRange(1, 1080)
+        self.pan_range_spin.setValue(self.main_window.project.geometry.pan_range_deg)
+        self.pan_range_spin.setSuffix(" deg")
+        self.tilt_range_spin = QDoubleSpinBox()
+        self.tilt_range_spin.setRange(1, 540)
+        self.tilt_range_spin.setValue(self.main_window.project.geometry.tilt_range_deg)
+        self.tilt_range_spin.setSuffix(" deg")
+        fit_btn = QPushButton("Fit head from saved points")
+        fit_btn.setStyleSheet("font-weight: 700;")
+        fit_btn.clicked.connect(self._fit_geometry)
+        self.fit_status = QLabel("Use the center cross. Coordinates come from the plan, not from walking the whole stage.")
+        self.fit_status.setWordWrap(True)
+        geometry_form.addRow("Pan range", self.pan_range_spin)
+        geometry_form.addRow("Tilt range", self.tilt_range_spin)
+        geometry_form.addRow(fit_btn)
+        geometry_form.addRow(self.fit_status)
+        right.addWidget(geometry_box)
 
         jog_box = QGroupBox("Aim the head")
         jog_layout = QVBoxLayout(jog_box)
@@ -186,6 +214,13 @@ class CalibrationWizardDialog(QDialog):
 
         root.addWidget(QLabel("Workflow: select a point, turn Laser ON, aim with pan/tilt, then Save & Next. Press Esc in the main window or EMERGENCY OFF here to blackout laser."))
 
+    def _fit_to_screen(self) -> None:
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        available = screen.availableGeometry()
+        self.resize(min(self.width(), available.width() - 80), min(self.height(), available.height() - 100))
+
     def _spin(self, minimum: int, maximum: int, value: int) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
@@ -194,8 +229,7 @@ class CalibrationWizardDialog(QDialog):
 
     def _initial_samples(self) -> list[CalibrationSample]:
         existing = self.main_window.project.calibration
-        legacy_names = {"front_left", "front_right", "back_left", "back_right"}
-        if not existing or any(sample.name in legacy_names or abs(sample.x_mm) > 3000 or abs(sample.y_mm) > 3000 for sample in existing):
+        if not existing:
             return make_cross_calibration_points(1000, self.main_window.current_pan, self.main_window.current_tilt)
         return [CalibrationSample(s.name, s.x_mm, s.y_mm, s.pan, s.tilt) for s in existing]
 
@@ -296,6 +330,23 @@ class CalibrationWizardDialog(QDialog):
         self.main_window.calibration.set_samples(self.main_window.project.calibration)
         self.main_window._populate_calibration()
 
+    def _fit_geometry(self) -> None:
+        self._apply_samples()
+        self.main_window.project.geometry.pan_range_deg = self.pan_range_spin.value()
+        self.main_window.project.geometry.tilt_range_deg = self.tilt_range_spin.value()
+        try:
+            fitted = fit_geometric_model(self.main_window.project.calibration, self.main_window.project.geometry)
+        except Exception as exc:
+            QMessageBox.warning(self, "Auto geometry", str(exc))
+            return
+        self.main_window.project.geometry = fitted
+        self.main_window.calibration.set_geometry(fitted)
+        self.fit_status.setText(
+            f"Fitted head: X={fitted.head_x_mm:.0f}, Y={fitted.head_y_mm:.0f}, Z={fitted.head_z_mm:.0f} mm. Error {fitted.fit_error_mm:.0f} mm."
+        )
+        self.main_window.refresh_geometry_status()
+        self.main_window.statusBar().showMessage("Auto geometry fitted", 5000)
+
     def _finish(self) -> None:
         self._apply_samples()
         self.main_window.emergency_laser_off()
@@ -383,11 +434,20 @@ class MainWindow(QMainWindow):
 
     def _make_floating_dock(self, title: str, widget: QWidget, width: int, height: int) -> QDockWidget:
         dock = QDockWidget(title, self)
-        dock.setWidget(widget)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(widget)
+        dock.setWidget(scroll)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         dock.setFloating(True)
+        screen = QApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            width = min(width, max(280, available.width() - 80))
+            height = min(height, max(420, available.height() - 100))
+            dock.move(available.x() + 40, available.y() + 60)
         dock.resize(width, height)
         dock.hide()
         return dock
@@ -481,6 +541,29 @@ class MainWindow(QMainWindow):
         laser_layout.addWidget(emergency, 3, 0, 1, 2)
         layout.addWidget(laser_box)
 
+        geometry_box = QGroupBox("Aiming model")
+        geometry_form = QFormLayout(geometry_box)
+        self.geometry_enabled = QCheckBox("Use fitted geometry")
+        self.geometry_enabled.setChecked(True)
+        self.geometry_enabled.toggled.connect(self.apply_fixture_config)
+        self.pan_range_control = QDoubleSpinBox()
+        self.pan_range_control.setRange(1, 1080)
+        self.pan_range_control.setValue(540)
+        self.pan_range_control.setSuffix(" deg")
+        self.tilt_range_control = QDoubleSpinBox()
+        self.tilt_range_control.setRange(1, 540)
+        self.tilt_range_control.setValue(270)
+        self.tilt_range_control.setSuffix(" deg")
+        self.pan_range_control.valueChanged.connect(self.apply_fixture_config)
+        self.tilt_range_control.valueChanged.connect(self.apply_fixture_config)
+        self.geometry_status = QLabel("Not fitted")
+        self.geometry_status.setWordWrap(True)
+        geometry_form.addRow(self.geometry_enabled)
+        geometry_form.addRow("Pan range", self.pan_range_control)
+        geometry_form.addRow("Tilt range", self.tilt_range_control)
+        geometry_form.addRow(self.geometry_status)
+        layout.addWidget(geometry_box)
+
         layout.addStretch(1)
         return panel
 
@@ -563,6 +646,7 @@ class MainWindow(QMainWindow):
         self.fixture.update_config(self.project.fixture)
         self.artnet.configure(self.project.fixture.artnet_ip, self.project.fixture.artnet_port, self.project.fixture.universe)
         self.send_current_dmx()
+        self.refresh_geometry_status()
 
     def _manual_pan_tilt_changed(self) -> None:
         if self._building_ui:
@@ -675,6 +759,17 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self.statusBar().showMessage(f"Art-Net send failed: {exc}", 5000)
 
+    def refresh_geometry_status(self) -> None:
+        geometry = self.project.geometry
+        if not hasattr(self, "geometry_status"):
+            return
+        if geometry.fitted:
+            self.geometry_status.setText(
+                f"Fitted: X={geometry.head_x_mm:.0f}, Y={geometry.head_y_mm:.0f}, Z={geometry.head_z_mm:.0f} mm. Error {geometry.fit_error_mm:.0f} mm."
+            )
+        else:
+            self.geometry_status.setText("Not fitted. Use Calibration Wizard, save center-cross points, then Fit head.")
+
     def _refresh_all(self) -> None:
         self._building_ui = True
         cfg = self.project.fixture
@@ -686,6 +781,9 @@ class MainWindow(QMainWindow):
         self.tilt_channel_spin.setValue(cfg.tilt_channel)
         self.laser_channel_spin.setValue(cfg.laser_channel)
         self.mode_16bit.setChecked(cfg.pan_tilt_16bit)
+        self.geometry_enabled.setChecked(self.project.geometry.enabled)
+        self.pan_range_control.setValue(self.project.geometry.pan_range_deg)
+        self.tilt_range_control.setValue(self.project.geometry.tilt_range_deg)
         self.pan_min_spin.setValue(cfg.pan_min)
         self.pan_max_spin.setValue(cfg.pan_max)
         self.tilt_min_spin.setValue(cfg.tilt_min)
@@ -698,9 +796,11 @@ class MainWindow(QMainWindow):
         if not self.project.calibration:
             self.project.calibration = make_cross_calibration_points(1000, self.current_pan, self.current_tilt)
         self.calibration.set_samples(self.project.calibration)
+        self.calibration.set_geometry(self.project.geometry)
         self.fixture.update_config(cfg)
         self.artnet.configure(cfg.artnet_ip, cfg.artnet_port, cfg.universe)
         self._populate_objects(self.project.objects)
+        self.refresh_geometry_status()
 
     def _populate_objects(self, objects: list[PlanObject]) -> None:
         self.object_list.clear()
@@ -711,6 +811,7 @@ class MainWindow(QMainWindow):
 
     def _populate_calibration(self) -> None:
         self.calibration.set_samples(self.project.calibration)
+        self.calibration.set_geometry(self.project.geometry)
 
     def _sync_project_from_ui(self) -> None:
         cfg = FixtureConfig(
@@ -728,6 +829,10 @@ class MainWindow(QMainWindow):
             pan_tilt_16bit=self.mode_16bit.isChecked(),
         )
         self.project.fixture = cfg
+        self.project.geometry.enabled = self.geometry_enabled.isChecked()
+        self.project.geometry.pan_range_deg = self.pan_range_control.value()
+        self.project.geometry.tilt_range_deg = self.tilt_range_control.value()
+        self.calibration.set_geometry(self.project.geometry)
         self.project.pdf_scale = self.plan_view.pdf_scale
 
 

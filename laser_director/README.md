@@ -43,15 +43,17 @@ All stage coordinates are stored in millimeters. The convention is:
 
 ## Calibrate the Moving Head
 
-The first version uses interpolation from nearby calibration points. SciPy `griddata` is used when available; otherwise the app falls back to inverse distance weighting.
+The intended workflow is a compact calibration cross near stage zero. You do not need to mark the whole stage.
 
 1. Click `Start calibration wizard`.
 2. The first point is selected and highlighted on the plan.
-3. Turn `Laser ON`.
-4. Use the large `Pan -`, `Pan +`, `Tilt -`, `Tilt +` buttons and the jog step field until the beam hits the real point on stage.
-5. Click `Save & Next`.
-6. Repeat until all points are saved, then click `Finish`.
-7. Save the project.
+3. Enter the pan and tilt ranges from the fixture manual, for example `Pan 540 deg`, `Tilt 270 deg`.
+4. Turn `Laser ON`.
+5. Use the large `Pan -`, `Pan +`, `Tilt -`, `Tilt +` buttons and the jog step field until the beam hits the real calibration point.
+6. Click `Save & Next`.
+7. Repeat for the center-cross points.
+8. Click `Fit head from saved points`.
+9. Click `Finish`, then save the project.
 
 The default calibration is a compact cross around stage zero, so you do not need to walk the whole stage:
 
@@ -65,7 +67,7 @@ In the wizard, use `Radius, mm` and `Reset to cross around zero` if you want ano
 
 Pan and tilt are stored internally as `0-65535` in 16-bit mode. In 8-bit mode they are stored and sent as `0-255`.
 
-The calibration table remains available for manual review and edits, but the wizard is the intended workflow.
+After fitting, clicks on the plan use the geometric head model. If the model is not fitted yet, the app falls back to interpolation from the saved points.
 
 ## Use with Vectorworks via DXF
 
