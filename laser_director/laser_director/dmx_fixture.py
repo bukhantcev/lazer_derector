@@ -12,6 +12,7 @@ class DmxFixture:
 
     def update_config(self, config: FixtureConfig) -> None:
         self.config = replace(config)
+        self.apply_extra_channels()
 
     def clamp_pan_tilt(self, pan: int, tilt: int) -> tuple[int, int]:
         cfg = self.config
@@ -25,6 +26,7 @@ class DmxFixture:
     def set_pan_tilt(self, pan: int, tilt: int) -> bytearray:
         pan, tilt = self.clamp_pan_tilt(pan, tilt)
         cfg = self.config
+        self.apply_extra_channels()
         if cfg.pan_tilt_16bit:
             self._set_16(cfg.address + cfg.pan_channel - 2, pan)
             self._set_16(cfg.address + cfg.tilt_channel - 2, tilt)
@@ -34,8 +36,14 @@ class DmxFixture:
         return self.levels
 
     def set_laser(self, enabled: bool) -> bytearray:
+        self.apply_extra_channels()
         value = self.config.laser_on_value if enabled else self.config.laser_off_value
         self._set_8(self.config.address + self.config.laser_channel - 2, value)
+        return self.levels
+
+    def apply_extra_channels(self) -> bytearray:
+        for item in self.config.extra_channels:
+            self._set_8(self.config.address + item.channel - 2, item.level)
         return self.levels
 
     def laser_off(self) -> bytearray:

@@ -8,7 +8,6 @@ from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QDialog,
     QDockWidget,
     QDoubleSpinBox,
@@ -33,9 +32,16 @@ from PySide6.QtWidgets import (
 )
 
 from .artnet import ArtNetSender
-from .calibration import CalibrationModel, fit_geometric_model
+from .calibration import (
+    CalibrationModel,
+    equivalent_pan_values,
+    fit_geometric_model,
+    pan_turn_period_dmx,
+    recommended_pan_branch,
+)
 from .dmx_fixture import DmxFixture
-from .models import CalibrationSample, FixtureConfig, PlanObject, Project
+from . import __build__, __version__
+from .models import CalibrationSample, ExtraDmxChannel, FixtureConfig, PlanObject, Project
 from .plan_view import PlanView
 from .project import load_project, save_project
 from .vectorworks_import import read_dxf
@@ -50,6 +56,20 @@ DEFAULT_CALIBRATION_POINTS = [
 ]
 
 
+MINI_LASER_13CH_EXTRA_CHANNELS = [
+    ExtraDmxChannel(channel=3, level=128, name="XY speed"),
+    ExtraDmxChannel(channel=4, level=0, name="Z rotation off"),
+    ExtraDmxChannel(channel=6, level=0, name="Strobe off"),
+    ExtraDmxChannel(channel=7, level=255, name="Red"),
+    ExtraDmxChannel(channel=8, level=255, name="Green"),
+    ExtraDmxChannel(channel=9, level=255, name="Blue"),
+    ExtraDmxChannel(channel=10, level=255, name="White"),
+    ExtraDmxChannel(channel=11, level=255, name="Green laser"),
+    ExtraDmxChannel(channel=12, level=0, name="Macro off"),
+    ExtraDmxChannel(channel=13, level=0, name="Reset off"),
+]
+
+
 def make_cross_calibration_points(radius_mm: int, pan: int, tilt: int) -> list[CalibrationSample]:
     return [
         CalibrationSample("center", 0, 0, pan, tilt),
@@ -60,13 +80,44 @@ def make_cross_calibration_points(radius_mm: int, pan: int, tilt: int) -> list[C
     ]
 
 
+def normalize_calibration_samples(samples: list[CalibrationSample], fixture: FixtureConfig) -> list[CalibrationSample]:
+    if fixture.pan_tilt_16bit:
+        return samples
+    normalized: list[CalibrationSample] = []
+    for sample in samples:
+        pan = sample.pan
+        tilt = sample.tilt
+        if pan > 255:
+            pan = round(pan / 257)
+        if tilt > 255:
+            tilt = round(tilt / 257)
+        normalized.append(
+            CalibrationSample(
+                sample.name,
+                sample.x_mm,
+                sample.y_mm,
+                max(0, min(255, pan)),
+                max(0, min(255, tilt)),
+            )
+        )
+    return normalized
+
+
+def calibration_samples_have_movement(samples: list[CalibrationSample]) -> bool:
+    if len(samples) < 2:
+        return False
+    pans = [sample.pan for sample in samples]
+    tilts = [sample.tilt for sample in samples]
+    return max(pans) - min(pans) > 1 or max(tilts) - min(tilts) > 1
+
+
 class CalibrationWizardDialog(QDialog):
     def __init__(self, main_window: "MainWindow") -> None:
         super().__init__(main_window)
         self.main_window = main_window
         self.samples = self._initial_samples()
         self.current_index = 0
-        self.saved_indexes: set[int] = set()
+        self.saved_indexes: set[int] = set(range(len(self.samples))) if calibration_samples_have_movement(self.samples) else set()
         self._syncing = False
 
         self.setWindowTitle("Calibration Wizard")
@@ -133,12 +184,32 @@ class CalibrationWizardDialog(QDialog):
         values_form.addRow("Tilt", self.tilt_spin)
         right.addWidget(values_box)
 
+        branch_box = QGroupBox("Pan rotation")
+        branch_layout = QVBoxLayout(branch_box)
+        self.branch_lock = QCheckBox("Keep one Pan rotation")
+        self.branch_lock.setChecked(True)
+        self.branch_lock.toggled.connect(self._refresh_branch_status)
+        self.branch_status = QLabel()
+        self.branch_status.setWordWrap(True)
+        self.use_branch_btn = QPushButton("Use recommended Pan turn")
+        self.use_branch_btn.clicked.connect(self._use_recommended_branch)
+        self.verify_btn = QPushButton("Verify saved point")
+        self.verify_btn.clicked.connect(self._verify_current_point)
+        branch_buttons = QHBoxLayout()
+        branch_buttons.addWidget(self.use_branch_btn)
+        branch_buttons.addWidget(self.verify_btn)
+        branch_layout.addWidget(self.branch_lock)
+        branch_layout.addWidget(self.branch_status)
+        branch_layout.addLayout(branch_buttons)
+        right.addWidget(branch_box)
+
         geometry_box = QGroupBox("Auto geometry")
         geometry_form = QFormLayout(geometry_box)
         self.pan_range_spin = QDoubleSpinBox()
         self.pan_range_spin.setRange(1, 1080)
         self.pan_range_spin.setValue(self.main_window.project.geometry.pan_range_deg)
         self.pan_range_spin.setSuffix(" deg")
+        self.pan_range_spin.valueChanged.connect(self._refresh_branch_status)
         self.tilt_range_spin = QDoubleSpinBox()
         self.tilt_range_spin.setRange(1, 540)
         self.tilt_range_spin.setValue(self.main_window.project.geometry.tilt_range_deg)
@@ -250,15 +321,19 @@ class CalibrationWizardDialog(QDialog):
         self.step_label.setText(f"Step {index + 1} of {len(self.samples)}: {sample.name}")
         self.coord_label.setText(f"Real point: X={sample.x_mm:g} mm, Y={sample.y_mm:g} mm")
         self.main_window.plan_view.show_target(sample.x_mm, sample.y_mm)
+        if index in self.saved_indexes:
+            self.main_window.set_pan_tilt_values(sample.pan, sample.tilt)
         self._syncing = True
         self.pan_spin.setValue(self.main_window.current_pan)
         self.tilt_spin.setValue(self.main_window.current_tilt)
         self._syncing = False
+        self._refresh_branch_status()
 
     def _manual_values_changed(self) -> None:
         if self._syncing:
             return
         self.main_window.set_pan_tilt_values(self.pan_spin.value(), self.tilt_spin.value())
+        self._refresh_branch_status()
 
     def _jog(self, pan_dir: int, tilt_dir: int) -> None:
         step = self.step_spin.value()
@@ -270,9 +345,124 @@ class CalibrationWizardDialog(QDialog):
         self.pan_spin.setValue(self.main_window.current_pan)
         self.tilt_spin.setValue(self.main_window.current_tilt)
         self._syncing = False
+        self._refresh_branch_status()
 
-    def _save_current(self) -> None:
+    def _dmx_max(self) -> int:
+        return 65535 if self.main_window.project.fixture.pan_tilt_16bit else 255
+
+    def _saved_samples_except_current(self) -> list[CalibrationSample]:
+        return [
+            sample
+            for index, sample in enumerate(self.samples)
+            if index in self.saved_indexes and index != self.current_index
+        ]
+
+    def _expected_pan(self) -> float | None:
         sample = self.samples[self.current_index]
+        saved = self._saved_samples_except_current()
+        if not saved:
+            return None
+        ranked: list[tuple[float, CalibrationSample]] = []
+        for item in saved:
+            distance = ((item.x_mm - sample.x_mm) ** 2 + (item.y_mm - sample.y_mm) ** 2) ** 0.5
+            if distance < 1e-6:
+                return float(item.pan)
+            ranked.append((distance, item))
+        ranked.sort(key=lambda value: value[0])
+        selected = ranked[: min(4, len(ranked))]
+        weights = [1.0 / max(1.0, distance**2) for distance, _ in selected]
+        weight_sum = sum(weights)
+        return sum(weight * item.pan for weight, (_, item) in zip(weights, selected)) / weight_sum
+
+    def _recommended_pan(self) -> int:
+        return recommended_pan_branch(
+            self.main_window.current_pan,
+            self._dmx_max(),
+            self.pan_range_spin.value(),
+            self._expected_pan(),
+        )
+
+    def _refresh_branch_status(self) -> None:
+        if not hasattr(self, "branch_status") or not self.samples:
+            return
+        current = self.main_window.current_pan
+        maximum = self._dmx_max()
+        period = pan_turn_period_dmx(maximum, self.pan_range_spin.value())
+        candidates = equivalent_pan_values(current, maximum, self.pan_range_spin.value())
+        recommended = self._recommended_pan()
+        expected = self._expected_pan()
+        margin = min(current, maximum - current)
+        if recommended != current:
+            self.branch_status.setText(
+                f"Recommended Pan {recommended}; current {current} is another 360 deg turn. "
+                f"One turn is {period:.1f} DMX."
+            )
+            self.branch_status.setStyleSheet("color: #b54708; font-weight: 600;")
+            self.use_branch_btn.setEnabled(True)
+            return
+
+        possible_flip = False
+        if expected is not None:
+            half_turn = period / 2
+            possible_flip = abs(abs(current - expected) - half_turn) < max(4.0, half_turn * 0.18)
+        if possible_flip:
+            self.branch_status.setText(
+                f"Possible head-flip branch: Pan differs from nearby points by about 180 deg. "
+                f"Verify the saved point before continuing."
+            )
+            self.branch_status.setStyleSheet("color: #b54708; font-weight: 600;")
+        else:
+            options = ", ".join(str(value) for value in candidates)
+            self.branch_status.setText(
+                f"Branch OK. Pan margin {margin}; equivalent full-turn values: {options}."
+            )
+            self.branch_status.setStyleSheet("color: #18794e;")
+        self.use_branch_btn.setEnabled(False)
+
+    def _use_recommended_branch(self) -> None:
+        recommended = self._recommended_pan()
+        if recommended == self.main_window.current_pan:
+            return
+        self.main_window.set_pan_tilt_values(recommended, self.main_window.current_tilt)
+        self._syncing = True
+        self.pan_spin.setValue(self.main_window.current_pan)
+        self.tilt_spin.setValue(self.main_window.current_tilt)
+        self._syncing = False
+        self._refresh_branch_status()
+        self.main_window.statusBar().showMessage(
+            "Moved to the recommended full-turn equivalent. Verify the laser point, then save.",
+            5000,
+        )
+
+    def _verify_current_point(self) -> None:
+        if self.current_index not in self.saved_indexes:
+            QMessageBox.information(self, "Verify point", "Save this calibration point first.")
+            return
+        sample = self.samples[self.current_index]
+        self.main_window.set_pan_tilt_values(sample.pan, sample.tilt)
+        self._syncing = True
+        self.pan_spin.setValue(sample.pan)
+        self.tilt_spin.setValue(sample.tilt)
+        self._syncing = False
+        self.main_window.flash_point()
+        self._refresh_branch_status()
+
+    def _save_current(self) -> bool:
+        sample = self.samples[self.current_index]
+        if self.branch_lock.isChecked():
+            recommended = self._recommended_pan()
+            if recommended != self.main_window.current_pan:
+                answer = QMessageBox.question(
+                    self,
+                    "Different Pan rotation",
+                    f"Current Pan {self.main_window.current_pan} is on another 360 deg turn. "
+                    f"Move to equivalent Pan {recommended} before saving?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer == QMessageBox.Yes:
+                    self._use_recommended_branch()
+                    return False
         sample.pan = self.main_window.current_pan
         sample.tilt = self.main_window.current_tilt
         self.saved_indexes.add(self.current_index)
@@ -280,9 +470,12 @@ class CalibrationWizardDialog(QDialog):
         self._populate_points()
         self.point_list.setCurrentRow(self.current_index)
         self.main_window.statusBar().showMessage(f"Saved calibration point: {sample.name}", 2500)
+        self._refresh_branch_status()
+        return True
 
     def _save_and_next(self) -> None:
-        self._save_current()
+        if not self._save_current():
+            return
         if self.current_index < len(self.samples) - 1:
             self.point_list.setCurrentRow(self.current_index + 1)
         else:
@@ -326,29 +519,70 @@ class CalibrationWizardDialog(QDialog):
         self._populate_points()
 
     def _apply_samples(self) -> None:
-        self.main_window.project.calibration = [CalibrationSample(s.name, s.x_mm, s.y_mm, s.pan, s.tilt) for s in self.samples]
+        self.main_window.project.calibration = [
+            CalibrationSample(s.name, s.x_mm, s.y_mm, s.pan, s.tilt)
+            for index, s in enumerate(self.samples)
+            if index in self.saved_indexes
+        ]
         self.main_window.calibration.set_samples(self.main_window.project.calibration)
         self.main_window._populate_calibration()
 
-    def _fit_geometry(self) -> None:
+    def _calibration_conflict(self) -> str | None:
+        saved = [sample for index, sample in enumerate(self.samples) if index in self.saved_indexes]
+        for index, first in enumerate(saved):
+            for second in saved[index + 1 :]:
+                coordinate_distance = ((first.x_mm - second.x_mm) ** 2 + (first.y_mm - second.y_mm) ** 2) ** 0.5
+                if coordinate_distance < 1.0:
+                    continue
+                if abs(first.pan - second.pan) <= 1 and abs(first.tilt - second.tilt) <= 1:
+                    return (
+                        f"{first.name} and {second.name} are different stage points but both use "
+                        f"Pan {first.pan}, Tilt {first.tilt}. Re-aim and save one of them."
+                    )
+        return None
+
+    def _fit_geometry(self) -> bool:
         self._apply_samples()
+        if len(self.main_window.project.calibration) < 5:
+            QMessageBox.warning(self, "Auto geometry", "Save at least five calibration points before fitting the head.")
+            return False
+        conflict = self._calibration_conflict()
+        if conflict:
+            QMessageBox.warning(self, "Calibration conflict", conflict)
+            self.fit_status.setText(conflict)
+            self.fit_status.setStyleSheet("color: #b42318; font-weight: 600;")
+            return False
         self.main_window.project.geometry.pan_range_deg = self.pan_range_spin.value()
         self.main_window.project.geometry.tilt_range_deg = self.tilt_range_spin.value()
+        dmx_max = 65535 if self.main_window.project.fixture.pan_tilt_16bit else 255
         try:
-            fitted = fit_geometric_model(self.main_window.project.calibration, self.main_window.project.geometry)
+            fitted = fit_geometric_model(
+                self.main_window.project.calibration,
+                self.main_window.project.geometry,
+                dmx_max,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "Auto geometry", str(exc))
-            return
+            return False
         self.main_window.project.geometry = fitted
         self.main_window.calibration.set_geometry(fitted)
+        fit_error = fitted.fit_error_mm or 0
         self.fit_status.setText(
-            f"Fitted head: X={fitted.head_x_mm:.0f}, Y={fitted.head_y_mm:.0f}, Z={fitted.head_z_mm:.0f} mm. Error {fitted.fit_error_mm:.0f} mm."
+            f"Fitted head: X={fitted.head_x_mm:.0f}, Y={fitted.head_y_mm:.0f}, "
+            f"Z={fitted.head_z_mm:.0f} mm. Error {fit_error:.0f} mm."
         )
+        if fit_error > self.radius_spin.value() * 0.25:
+            self.fit_status.setStyleSheet("color: #b54708; font-weight: 600;")
+        else:
+            self.fit_status.setStyleSheet("color: #18794e; font-weight: 600;")
         self.main_window.refresh_geometry_status()
         self.main_window.statusBar().showMessage("Auto geometry fitted", 5000)
+        return True
 
     def _finish(self) -> None:
         self._apply_samples()
+        if not self._fit_geometry():
+            return
         self.main_window.emergency_laser_off()
         self.accept()
 
@@ -356,24 +590,32 @@ class CalibrationWizardDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Laser Director")
+        self.setWindowTitle(f"Laser Director {__version__} [{__build__}]")
         self.resize(1440, 900)
         self.project = Project(name="Untitled")
         self.project_file: Path | None = None
         self.fixture = DmxFixture(self.project.fixture)
         self.artnet = ArtNetSender(self.project.fixture.artnet_ip, self.project.fixture.artnet_port, self.project.fixture.universe)
         self.calibration = CalibrationModel(self.project.calibration)
-        self.current_pan = 32768
-        self.current_tilt = 32768
+        self.extra_channel_rows: list[tuple[QWidget, QLineEdit, QSpinBox, QSpinBox]] = []
+        self.current_pan = 128
+        self.current_tilt = 128
         self.point_queue: list[tuple[float, float]] = []
         self.point_index = 0
         self._building_ui = False
+        self.follow_cursor_enabled = False
+        self._pending_follow_point: tuple[float, float] | None = None
+        self._calibration_warning_shown = False
 
         self.plan_view = PlanView()
         self.plan_view.pointClicked.connect(self.goto_point)
+        self.plan_view.pointHovered.connect(self.follow_cursor_point)
         self.plan_view.objectSelected.connect(self.select_object_in_list)
         self.object_list = QListWidget()
         self.object_list.itemSelectionChanged.connect(self._object_list_changed)
+        self.follow_cursor_timer = QTimer(self)
+        self.follow_cursor_timer.setInterval(40)
+        self.follow_cursor_timer.timeout.connect(self._flush_follow_cursor)
 
         self._build_actions()
         self._build_layout()
@@ -401,6 +643,11 @@ class MainWindow(QMainWindow):
             action = QAction(title, self)
             action.triggered.connect(slot)
             self.toolbar.addAction(action)
+        self.toolbar.addSeparator()
+        self.follow_cursor_action = QAction("Follow Cursor", self)
+        self.follow_cursor_action.setCheckable(True)
+        self.follow_cursor_action.toggled.connect(self.set_follow_cursor_enabled)
+        self.toolbar.addAction(self.follow_cursor_action)
 
     def _build_layout(self) -> None:
         left = QWidget()
@@ -466,7 +713,7 @@ class MainWindow(QMainWindow):
         self.tilt_channel_spin = self._spin(1, 512, 3)
         self.laser_channel_spin = self._spin(1, 512, 5)
         self.mode_16bit = QCheckBox("16-bit pan/tilt")
-        self.mode_16bit.setChecked(True)
+        self.mode_16bit.setChecked(False)
         for widget in [self.ip_edit, self.port_spin, self.universe_spin, self.address_spin, self.pan_channel_spin, self.tilt_channel_spin, self.laser_channel_spin, self.mode_16bit]:
             if hasattr(widget, "valueChanged"):
                 widget.valueChanged.connect(self.apply_fixture_config)
@@ -480,14 +727,34 @@ class MainWindow(QMainWindow):
         form.addRow("DMX address", self.address_spin)
         form.addRow("Pan channel", self.pan_channel_spin)
         form.addRow("Tilt channel", self.tilt_channel_spin)
-        form.addRow("Laser channel", self.laser_channel_spin)
+        form.addRow("Dimmer channel", self.laser_channel_spin)
         form.addRow(self.mode_16bit)
+        preset_13ch = QPushButton("Apply 13CH laser manual")
+        preset_13ch.clicked.connect(self.apply_mini_laser_13ch_preset)
+        form.addRow(preset_13ch)
+        apply_settings = QPushButton("APPLY / SEND SETTINGS")
+        apply_settings.setMinimumHeight(42)
+        apply_settings.setStyleSheet("font-weight: 700;")
+        apply_settings.clicked.connect(self.apply_fixture_config)
+        self.fixture_status = QLabel("Settings not applied yet")
+        self.fixture_status.setWordWrap(True)
+        form.addRow(apply_settings)
+        form.addRow(self.fixture_status)
         layout.addWidget(artnet_box)
+
+        extra_box = QGroupBox("Extra DMX channels")
+        extra_layout = QVBoxLayout(extra_box)
+        self.extra_channels_layout = QVBoxLayout()
+        extra_layout.addLayout(self.extra_channels_layout)
+        add_extra = QPushButton("Add channel")
+        add_extra.clicked.connect(lambda: self.add_extra_channel_row())
+        extra_layout.addWidget(add_extra)
+        layout.addWidget(extra_box)
 
         range_box = QGroupBox("Pan / Tilt")
         range_form = QFormLayout(range_box)
-        self.pan_spin = self._spin(0, 65535, self.current_pan)
-        self.tilt_spin = self._spin(0, 65535, self.current_tilt)
+        self.pan_spin = self._spin(0, 255, min(self.current_pan, 255))
+        self.tilt_spin = self._spin(0, 255, min(self.current_tilt, 255))
         self.pan_min_spin = self._spin(0, 65535, 0)
         self.pan_max_spin = self._spin(0, 65535, 65535)
         self.tilt_min_spin = self._spin(0, 65535, 0)
@@ -522,23 +789,38 @@ class MainWindow(QMainWindow):
 
         laser_box = QGroupBox("Laser")
         laser_layout = QGridLayout(laser_box)
+        self.dimmer_level_spin = self._spin(0, 255, 255)
+        self.blackout_level_spin = self._spin(0, 255, 0)
+        self.dimmer_level_spin.valueChanged.connect(self.apply_fixture_config)
+        self.blackout_level_spin.valueChanged.connect(self.apply_fixture_config)
         laser_on = QPushButton("Laser ON")
         laser_off = QPushButton("Laser OFF")
         flash = QPushButton("Flash point 1 sec")
+        full_test = QPushButton("FULL LASER TEST")
         emergency = QPushButton("EMERGENCY OFF")
         wizard = QPushButton("CALIBRATION WIZARD")
+        self.follow_cursor_checkbox = QCheckBox("Follow cursor")
         emergency.setStyleSheet("font-weight: 700; color: white; background: #b00020;")
+        full_test.setStyleSheet("font-weight: 700;")
         wizard.setStyleSheet("font-weight: 700;")
         laser_on.clicked.connect(lambda: self.set_laser(True))
         laser_off.clicked.connect(lambda: self.set_laser(False))
         flash.clicked.connect(self.flash_point)
+        full_test.clicked.connect(self.full_laser_test)
         emergency.clicked.connect(self.emergency_laser_off)
         wizard.clicked.connect(self.open_calibration_wizard)
-        laser_layout.addWidget(laser_on, 0, 0)
-        laser_layout.addWidget(laser_off, 0, 1)
-        laser_layout.addWidget(flash, 1, 0, 1, 2)
-        laser_layout.addWidget(wizard, 2, 0, 1, 2)
-        laser_layout.addWidget(emergency, 3, 0, 1, 2)
+        self.follow_cursor_checkbox.toggled.connect(self.set_follow_cursor_enabled)
+        laser_layout.addWidget(QLabel("Dimmer level"), 0, 0)
+        laser_layout.addWidget(self.dimmer_level_spin, 0, 1)
+        laser_layout.addWidget(QLabel("Blackout level"), 1, 0)
+        laser_layout.addWidget(self.blackout_level_spin, 1, 1)
+        laser_layout.addWidget(self.follow_cursor_checkbox, 2, 0, 1, 2)
+        laser_layout.addWidget(laser_on, 3, 0)
+        laser_layout.addWidget(laser_off, 3, 1)
+        laser_layout.addWidget(flash, 4, 0, 1, 2)
+        laser_layout.addWidget(full_test, 5, 0, 1, 2)
+        laser_layout.addWidget(wizard, 6, 0, 1, 2)
+        laser_layout.addWidget(emergency, 7, 0, 1, 2)
         layout.addWidget(laser_box)
 
         geometry_box = QGroupBox("Aiming model")
@@ -576,6 +858,79 @@ class MainWindow(QMainWindow):
         spin.setRange(minimum, maximum)
         spin.setValue(value)
         return spin
+
+    def add_extra_channel_row(self, item: ExtraDmxChannel | None = None) -> None:
+        channel = item.channel if item else 1
+        level = item.level if item else 0
+        name = item.name if item else ""
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        name_edit = QLineEdit(name)
+        name_edit.setPlaceholderText("Name")
+        channel_spin = self._spin(1, 512, channel)
+        level_spin = self._spin(0, 255, level)
+        remove_btn = QPushButton("Remove")
+        row_layout.addWidget(name_edit, 2)
+        row_layout.addWidget(QLabel("Ch"))
+        row_layout.addWidget(channel_spin)
+        row_layout.addWidget(QLabel("Level"))
+        row_layout.addWidget(level_spin)
+        row_layout.addWidget(remove_btn)
+        self.extra_channels_layout.addWidget(row)
+        self.extra_channel_rows.append((row, name_edit, channel_spin, level_spin))
+
+        name_edit.textChanged.connect(self.apply_fixture_config)
+        channel_spin.valueChanged.connect(self.apply_fixture_config)
+        level_spin.valueChanged.connect(self.apply_fixture_config)
+        remove_btn.clicked.connect(lambda: self.remove_extra_channel_row(row))
+
+    def remove_extra_channel_row(self, row: QWidget) -> None:
+        self.extra_channel_rows = [item for item in self.extra_channel_rows if item[0] is not row]
+        row.setParent(None)
+        row.deleteLater()
+        self.apply_fixture_config()
+
+    def populate_extra_channel_rows(self) -> None:
+        for row, _, _, _ in self.extra_channel_rows:
+            row.setParent(None)
+            row.deleteLater()
+        self.extra_channel_rows = []
+        for item in self.project.fixture.extra_channels:
+            self.add_extra_channel_row(item)
+
+    def read_extra_channel_rows(self) -> list[ExtraDmxChannel]:
+        channels: list[ExtraDmxChannel] = []
+        for _, name_edit, channel_spin, level_spin in self.extra_channel_rows:
+            channels.append(
+                ExtraDmxChannel(
+                    channel=channel_spin.value(),
+                    level=level_spin.value(),
+                    name=name_edit.text().strip(),
+                )
+            )
+        return channels
+
+    def apply_mini_laser_13ch_preset(self) -> None:
+        self._building_ui = True
+        self.pan_channel_spin.setValue(1)
+        self.tilt_channel_spin.setValue(2)
+        self.laser_channel_spin.setValue(5)
+        self.dimmer_level_spin.setValue(255)
+        self.blackout_level_spin.setValue(0)
+        self.mode_16bit.setChecked(False)
+        self.pan_min_spin.setValue(0)
+        self.pan_max_spin.setValue(255)
+        self.tilt_min_spin.setValue(0)
+        self.tilt_max_spin.setValue(255)
+        self._building_ui = False
+        self.project.fixture.extra_channels = [
+            ExtraDmxChannel(channel=item.channel, level=item.level, name=item.name)
+            for item in MINI_LASER_13CH_EXTRA_CHANNELS
+        ]
+        self.populate_extra_channel_rows()
+        self.apply_fixture_config()
+        self.statusBar().showMessage("13CH fixture settings applied and sent", 5000)
 
     def new_project(self) -> None:
         self.project = Project(name="Untitled")
@@ -640,13 +995,18 @@ class MainWindow(QMainWindow):
         if self._building_ui:
             return
         self._sync_project_from_ui()
+        self.project.calibration = normalize_calibration_samples(self.project.calibration, self.project.fixture)
+        self.calibration.set_samples(self.project.calibration)
         maximum = 65535 if self.project.fixture.pan_tilt_16bit else 255
+        self.calibration.set_dmx_max(maximum)
         self.pan_spin.setRange(0, maximum)
         self.tilt_spin.setRange(0, maximum)
         self.fixture.update_config(self.project.fixture)
+        self.fixture.apply_extra_channels()
         self.artnet.configure(self.project.fixture.artnet_ip, self.project.fixture.artnet_port, self.project.fixture.universe)
         self.send_current_dmx()
         self.refresh_geometry_status()
+        self.refresh_fixture_status()
 
     def _manual_pan_tilt_changed(self) -> None:
         if self._building_ui:
@@ -674,29 +1034,80 @@ class MainWindow(QMainWindow):
     def set_laser(self, enabled: bool) -> None:
         self.fixture.set_laser(enabled)
         self.send_current_dmx()
+        self.refresh_fixture_status()
 
     def emergency_laser_off(self) -> None:
         self.fixture.laser_off()
         self.send_current_dmx()
+        self.refresh_fixture_status()
 
     def flash_point(self) -> None:
         self.set_laser(True)
         QTimer.singleShot(1000, self.emergency_laser_off)
 
+    def full_laser_test(self) -> None:
+        self.apply_mini_laser_13ch_preset()
+        self.set_pan_tilt_values(128, 128)
+        self.set_laser(True)
+        self.statusBar().showMessage("Full laser test sent: dimmer and green laser at 255", 5000)
+
     def goto_point(self, x_mm: float, y_mm: float) -> None:
+        self.aim_at_point(x_mm, y_mm, warn=True)
+
+    def aim_at_point(self, x_mm: float, y_mm: float, warn: bool = False) -> bool:
+        geometry = self.project.geometry
+        if not (geometry.enabled and geometry.fitted) and not calibration_samples_have_movement(self.project.calibration):
+            message = "Calibration has no pan/tilt movement yet. Open Calibration Wizard and save several real aimed points."
+            if warn:
+                QMessageBox.warning(self, "Calibration required", message)
+            elif not self._calibration_warning_shown:
+                self.statusBar().showMessage(message, 5000)
+                self._calibration_warning_shown = True
+            return False
         try:
             pan, tilt = self.calibration.interpolate(x_mm, y_mm)
-        except ValueError:
-            QMessageBox.warning(self, "Calibration required", "Add at least one calibration point before clicking the plan.")
-            return
-        self.current_pan, self.current_tilt = self.fixture.clamp_pan_tilt(pan, tilt)
-        self._building_ui = True
-        self.pan_spin.setValue(self.current_pan)
-        self.tilt_spin.setValue(self.current_tilt)
-        self._building_ui = False
-        self.fixture.set_pan_tilt(self.current_pan, self.current_tilt)
+        except ValueError as exc:
+            if warn:
+                QMessageBox.warning(self, "Calibration required", "Run Calibration Wizard before aiming at points on the plan.")
+            elif not self._calibration_warning_shown:
+                self.statusBar().showMessage(f"Calibration required: {exc}", 5000)
+                self._calibration_warning_shown = True
+            return False
+        self._calibration_warning_shown = False
+        self.set_pan_tilt_values(pan, tilt)
         self.plan_view.show_target(x_mm, y_mm)
-        self.send_current_dmx()
+        self.statusBar().showMessage(f"Target X {x_mm:.0f} mm, Y {y_mm:.0f} mm -> pan {self.current_pan}, tilt {self.current_tilt}", 1500)
+        return True
+
+    def set_follow_cursor_enabled(self, enabled: bool) -> None:
+        if self.follow_cursor_enabled == enabled:
+            return
+        self.follow_cursor_enabled = enabled
+        self.follow_cursor_action.blockSignals(True)
+        self.follow_cursor_action.setChecked(enabled)
+        self.follow_cursor_action.blockSignals(False)
+        if hasattr(self, "follow_cursor_checkbox"):
+            self.follow_cursor_checkbox.blockSignals(True)
+            self.follow_cursor_checkbox.setChecked(enabled)
+            self.follow_cursor_checkbox.blockSignals(False)
+        if enabled:
+            self.follow_cursor_timer.start()
+            self.statusBar().showMessage("Follow cursor ON: pan/tilt follows the mouse, laser state is unchanged", 5000)
+        else:
+            self.follow_cursor_timer.stop()
+            self._pending_follow_point = None
+            self.statusBar().showMessage("Follow cursor OFF", 3000)
+
+    def follow_cursor_point(self, x_mm: float, y_mm: float) -> None:
+        if self.follow_cursor_enabled:
+            self._pending_follow_point = (x_mm, y_mm)
+
+    def _flush_follow_cursor(self) -> None:
+        if not self.follow_cursor_enabled or self._pending_follow_point is None:
+            return
+        x_mm, y_mm = self._pending_follow_point
+        self._pending_follow_point = None
+        self.aim_at_point(x_mm, y_mm, warn=False)
 
     def open_calibration_wizard(self) -> None:
         dialog = CalibrationWizardDialog(self)
@@ -770,7 +1181,19 @@ class MainWindow(QMainWindow):
         else:
             self.geometry_status.setText("Not fitted. Use Calibration Wizard, save center-cross points, then Fit head.")
 
+    def refresh_fixture_status(self) -> None:
+        if not hasattr(self, "fixture_status"):
+            return
+        cfg = self.project.fixture
+        mode = "16-bit" if cfg.pan_tilt_16bit else "8-bit"
+        non_zero = [(index + 1, value) for index, value in enumerate(self.fixture.levels[:32]) if value]
+        preview = ", ".join(f"{channel}={level}" for channel, level in non_zero[:16]) or "all zero"
+        self.fixture_status.setText(
+            f"Applied: {cfg.artnet_ip}:{cfg.artnet_port}, universe {cfg.universe}, address {cfg.address}, {mode}, {len(cfg.extra_channels)} extra channels.\nDMX: {preview}"
+        )
+
     def _refresh_all(self) -> None:
+        self._upgrade_legacy_geometry()
         self._building_ui = True
         cfg = self.project.fixture
         self.ip_edit.setText(cfg.artnet_ip)
@@ -781,9 +1204,12 @@ class MainWindow(QMainWindow):
         self.tilt_channel_spin.setValue(cfg.tilt_channel)
         self.laser_channel_spin.setValue(cfg.laser_channel)
         self.mode_16bit.setChecked(cfg.pan_tilt_16bit)
+        self.dimmer_level_spin.setValue(cfg.laser_on_value)
+        self.blackout_level_spin.setValue(cfg.laser_off_value)
         self.geometry_enabled.setChecked(self.project.geometry.enabled)
         self.pan_range_control.setValue(self.project.geometry.pan_range_deg)
         self.tilt_range_control.setValue(self.project.geometry.tilt_range_deg)
+        self.populate_extra_channel_rows()
         self.pan_min_spin.setValue(cfg.pan_min)
         self.pan_max_spin.setValue(cfg.pan_max)
         self.tilt_min_spin.setValue(cfg.tilt_min)
@@ -793,14 +1219,30 @@ class MainWindow(QMainWindow):
         self.pan_spin.setValue(min(self.current_pan, self.pan_spin.maximum()))
         self.tilt_spin.setValue(min(self.current_tilt, self.tilt_spin.maximum()))
         self._building_ui = False
-        if not self.project.calibration:
-            self.project.calibration = make_cross_calibration_points(1000, self.current_pan, self.current_tilt)
+        self.project.calibration = normalize_calibration_samples(self.project.calibration, cfg)
         self.calibration.set_samples(self.project.calibration)
+        self.calibration.set_dmx_max(65535 if cfg.pan_tilt_16bit else 255)
         self.calibration.set_geometry(self.project.geometry)
         self.fixture.update_config(cfg)
         self.artnet.configure(cfg.artnet_ip, cfg.artnet_port, cfg.universe)
         self._populate_objects(self.project.objects)
         self.refresh_geometry_status()
+        self.refresh_fixture_status()
+
+    def _upgrade_legacy_geometry(self) -> None:
+        geometry = self.project.geometry
+        if not geometry.fitted or geometry.model_version >= 2:
+            return
+        dmx_max = 65535 if self.project.fixture.pan_tilt_16bit else 255
+        try:
+            self.project.geometry = fit_geometric_model(self.project.calibration, geometry, dmx_max)
+        except Exception as exc:
+            geometry.fitted = False
+            geometry.enabled = False
+            geometry.model_version = 2
+            self.statusBar().showMessage(f"Old geometry disabled: {exc}", 8000)
+        else:
+            self.statusBar().showMessage("Saved geometry upgraded for the fixture DMX resolution", 8000)
 
     def _populate_objects(self, objects: list[PlanObject]) -> None:
         self.object_list.clear()
@@ -827,7 +1269,10 @@ class MainWindow(QMainWindow):
             tilt_min=self.tilt_min_spin.value(),
             tilt_max=self.tilt_max_spin.value(),
             pan_tilt_16bit=self.mode_16bit.isChecked(),
+            laser_on_value=self.dimmer_level_spin.value(),
+            laser_off_value=self.blackout_level_spin.value(),
         )
+        cfg.extra_channels = self.read_extra_channel_rows()
         self.project.fixture = cfg
         self.project.geometry.enabled = self.geometry_enabled.isChecked()
         self.project.geometry.pan_range_deg = self.pan_range_control.value()
@@ -840,6 +1285,8 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Laser Director")
+    print(f"Laser Director {__version__} [{__build__}]")
     window = MainWindow()
+    window.statusBar().showMessage(f"Running Laser Director {__version__} [{__build__}]", 8000)
     window.show()
     sys.exit(app.exec())

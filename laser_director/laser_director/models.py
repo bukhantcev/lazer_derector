@@ -60,6 +60,13 @@ class CalibrationSample:
 
 
 @dataclass
+class ExtraDmxChannel:
+    channel: int
+    level: int = 0
+    name: str = ""
+
+
+@dataclass
 class FixtureConfig:
     name: str = "Moving Head Laser"
     artnet_ip: str = "2.255.255.255"
@@ -67,15 +74,16 @@ class FixtureConfig:
     universe: int = 0
     address: int = 1
     pan_channel: int = 1
-    tilt_channel: int = 3
+    tilt_channel: int = 2
     laser_channel: int = 5
     pan_min: int = 0
-    pan_max: int = 65535
+    pan_max: int = 255
     tilt_min: int = 0
-    tilt_max: int = 65535
-    pan_tilt_16bit: bool = True
+    tilt_max: int = 255
+    pan_tilt_16bit: bool = False
     laser_on_value: int = 255
     laser_off_value: int = 0
+    extra_channels: list[ExtraDmxChannel] = field(default_factory=list)
 
 
 @dataclass
@@ -96,6 +104,7 @@ class FixtureGeometry:
     tilt_sign: int = 1
     fit_error_mm: float | None = None
     fitted: bool = False
+    model_version: int = 2
 
 
 @dataclass
@@ -120,8 +129,15 @@ class Project:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Project":
-        fixture = FixtureConfig(**data.get("fixture", {}))
-        geometry = FixtureGeometry(**data.get("geometry", {}))
+        fixture_data = data.get("fixture", {})
+        extra_channels = [ExtraDmxChannel(**item) for item in fixture_data.get("extra_channels", [])]
+        fixture_data = {key: value for key, value in fixture_data.items() if key != "extra_channels"}
+        fixture = FixtureConfig(**fixture_data)
+        fixture.extra_channels = extra_channels
+        geometry_data = dict(data.get("geometry", {}))
+        if geometry_data and "model_version" not in geometry_data:
+            geometry_data["model_version"] = 1
+        geometry = FixtureGeometry(**geometry_data)
         calibration = [CalibrationSample(**item) for item in data.get("calibration", [])]
         objects = [PlanObject(**item) for item in data.get("objects", [])]
         pdf_scale = PdfScale(**data.get("pdf_scale", {}))

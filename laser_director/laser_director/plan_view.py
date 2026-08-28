@@ -52,6 +52,7 @@ class ObjectGraphicsItem(QGraphicsItem):
 
 class PlanView(QGraphicsView):
     pointClicked = Signal(float, float)
+    pointHovered = Signal(float, float)
     objectSelected = Signal(object)
 
     def __init__(self) -> None:
@@ -63,6 +64,8 @@ class PlanView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
         self.setBackgroundBrush(QBrush(QColor("#11161d")))
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self.objects: list[PlanObject] = []
         self.pdf_scale = PdfScale()
         self.mm_per_scene_unit = 1.0
@@ -166,11 +169,15 @@ class PlanView(QGraphicsView):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
 
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        pos = self.mapToScene(event.position().toPoint())
+        self.pointHovered.emit(pos.x() * self.mm_per_scene_unit, -pos.y() * self.mm_per_scene_unit)
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:
             self._context_menu(event)
             return
-        super().mousePressEvent(event)
         if event.button() == Qt.LeftButton:
             pos = self.mapToScene(event.position().toPoint())
             if self._pdf_scale_points is not None and len(self._pdf_scale_points) < 2 and event.modifiers() & Qt.ShiftModifier:
@@ -179,6 +186,7 @@ class PlanView(QGraphicsView):
                     self._finish_pdf_scale()
                 return
             self.pointClicked.emit(pos.x() * self.mm_per_scene_unit, -pos.y() * self.mm_per_scene_unit)
+        super().mousePressEvent(event)
 
     def _context_menu(self, event) -> None:
         menu = QMenu(self)

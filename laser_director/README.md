@@ -45,15 +45,15 @@ All stage coordinates are stored in millimeters. The convention is:
 
 The intended workflow is a compact calibration cross near stage zero. You do not need to mark the whole stage.
 
-1. Click `Start calibration wizard`.
+1. Click `CALIBRATION WIZARD`.
 2. The first point is selected and highlighted on the plan.
 3. Enter the pan and tilt ranges from the fixture manual, for example `Pan 540 deg`, `Tilt 270 deg`.
 4. Turn `Laser ON`.
 5. Use the large `Pan -`, `Pan +`, `Tilt -`, `Tilt +` buttons and the jog step field until the beam hits the real calibration point.
-6. Click `Save & Next`.
-7. Repeat for the center-cross points.
-8. Click `Fit head from saved points`.
-9. Click `Finish`, then save the project.
+6. Check the `Pan rotation` status. For a 540-degree 8-bit fixture, Pan values separated by 170 DMX are equivalent full turns. Use `Use recommended Pan turn` when offered, verify that the beam stayed on the point, then save.
+7. Click `Save & Next` and repeat for the center-cross points. The branch lock compares each new point with the already saved neighboring points.
+8. Use `Verify saved point` to return to the selected calibration value and flash it.
+9. Click `Finish`. The wizard validates the points and fits the head automatically, then save the project.
 
 The default calibration is a compact cross around stage zero, so you do not need to walk the whole stage:
 
@@ -66,6 +66,8 @@ The default calibration is a compact cross around stage zero, so you do not need
 In the wizard, use `Radius, mm` and `Reset to cross around zero` if you want another size, for example 500 mm or 2000 mm.
 
 Pan and tilt are stored internally as `0-65535` in 16-bit mode. In 8-bit mode they are stored and sent as `0-255`.
+
+The wizard rejects two different stage coordinates saved with the same Pan/Tilt values. It also warns about a likely 180-degree head-flip branch. Saved calibration points remain exact anchors after geometric fitting.
 
 After fitting, clicks on the plan use the geometric head model. If the model is not fitted yet, the app falls back to interpolation from the saved points.
 

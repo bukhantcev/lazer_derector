@@ -7,6 +7,9 @@ from typing import Iterable
 from .models import CalibrationSample, FixtureGeometry
 
 
+INTERNAL_DMX_MAX = 65535
+
+
 def _deg_to_rad(value: float) -> float:
     return value * math.pi / 180.0
 
@@ -47,11 +50,68 @@ def _predict_xy(sample: CalibrationSample, geometry: FixtureGeometry) -> tuple[f
     return float(x), float(y)
 
 
-def fit_geometric_model(samples: Iterable[CalibrationSample], initial: FixtureGeometry) -> FixtureGeometry:
+def _to_internal_dmx(value: float, dmx_max: int) -> float:
+    return float(value) * INTERNAL_DMX_MAX / max(1, dmx_max)
+
+
+def _from_internal_dmx(value: float, dmx_max: int) -> int:
+    return int(round(float(value) * max(1, dmx_max) / INTERNAL_DMX_MAX))
+
+
+def pan_turn_period_dmx(dmx_max: int, pan_range_deg: float) -> float:
+    if pan_range_deg <= 0:
+        raise ValueError("Pan range must be greater than zero")
+    return max(1, dmx_max) * 360.0 / pan_range_deg
+
+
+def equivalent_pan_values(pan: int, dmx_max: int, pan_range_deg: float) -> list[int]:
+    period = pan_turn_period_dmx(dmx_max, pan_range_deg)
+    candidates = {
+        int(round(pan + turn * period))
+        for turn in range(-4, 5)
+        if 0 <= int(round(pan + turn * period)) <= dmx_max
+    }
+    return sorted(candidates)
+
+
+def recommended_pan_branch(
+    pan: int,
+    dmx_max: int,
+    pan_range_deg: float,
+    expected_pan: float | None = None,
+) -> int:
+    candidates = equivalent_pan_values(pan, dmx_max, pan_range_deg)
+    if not candidates:
+        return max(0, min(dmx_max, int(round(pan))))
+    if expected_pan is None:
+        return max(candidates, key=lambda value: (min(value, dmx_max - value), -abs(value - dmx_max / 2)))
+
+    def score(value: int) -> float:
+        edge_margin = min(value, dmx_max - value)
+        edge_penalty = max(0.0, dmx_max * 0.08 - edge_margin) * 0.25
+        return abs(value - expected_pan) + edge_penalty
+
+    return min(candidates, key=score)
+
+
+def fit_geometric_model(
+    samples: Iterable[CalibrationSample],
+    initial: FixtureGeometry,
+    dmx_max: int = INTERNAL_DMX_MAX,
+) -> FixtureGeometry:
     import numpy as np
     from scipy.optimize import least_squares
 
-    points = list(samples)
+    points = [
+        CalibrationSample(
+            sample.name,
+            sample.x_mm,
+            sample.y_mm,
+            _to_internal_dmx(sample.pan, dmx_max),
+            _to_internal_dmx(sample.tilt, dmx_max),
+        )
+        for sample in samples
+    ]
     if len(points) < 5:
         raise ValueError("Geometric calibration needs at least 5 points near stage zero")
 
@@ -123,19 +183,23 @@ def fit_geometric_model(samples: Iterable[CalibrationSample], initial: FixtureGe
 
     if best_geometry is None:
         raise ValueError("Could not solve geometric calibration")
-    return replace(best_geometry, fitted=True, fit_error_mm=best_cost)
+    return replace(best_geometry, fitted=True, fit_error_mm=best_cost, model_version=2)
 
 
 class CalibrationModel:
     def __init__(self, samples: Iterable[CalibrationSample] | None = None) -> None:
         self.samples = list(samples or [])
         self.geometry = FixtureGeometry(enabled=False)
+        self.dmx_max = INTERNAL_DMX_MAX
 
     def set_samples(self, samples: Iterable[CalibrationSample]) -> None:
         self.samples = list(samples)
 
     def set_geometry(self, geometry: FixtureGeometry) -> None:
         self.geometry = geometry
+
+    def set_dmx_max(self, dmx_max: int) -> None:
+        self.dmx_max = INTERNAL_DMX_MAX if dmx_max > 255 else 255
 
     def add_sample(self, sample: CalibrationSample) -> None:
         self.samples = [item for item in self.samples if item.name != sample.name]
@@ -167,23 +231,112 @@ class CalibrationModel:
         return self._idw(x_mm, y_mm)
 
     def solve_geometric(self, x_mm: float, y_mm: float) -> tuple[int, int]:
+        for sample in self.samples:
+            if math.hypot(sample.x_mm - x_mm, sample.y_mm - y_mm) < 1e-6:
+                return sample.pan, sample.tilt
+
+        reference_pan, reference_tilt = self._geometric_reference(x_mm, y_mm)
+        pan, tilt = self._solve_geometric_internal(x_mm, y_mm, reference_pan, reference_tilt)
+        output_pan = _from_internal_dmx(pan, self.dmx_max)
+        output_tilt = _from_internal_dmx(tilt, self.dmx_max)
+        pan_correction, tilt_correction = self._geometric_residual_correction(x_mm, y_mm)
+        return (
+            max(0, min(self.dmx_max, int(round(output_pan + pan_correction)))),
+            max(0, min(self.dmx_max, int(round(output_tilt + tilt_correction)))),
+        )
+
+    def _solve_geometric_internal(
+        self,
+        x_mm: float,
+        y_mm: float,
+        reference_pan: float,
+        reference_tilt: float,
+    ) -> tuple[float, float]:
         import numpy as np
-        from scipy.optimize import least_squares
 
         geometry = self.geometry
+        world_direction = np.array(
+            [
+                x_mm - geometry.head_x_mm,
+                y_mm - geometry.head_y_mm,
+                geometry.target_z_mm - geometry.head_z_mm,
+            ],
+            dtype=float,
+        )
+        length = float(np.linalg.norm(world_direction))
+        if length < 1e-9:
+            raise ValueError("Target point is at the moving head position")
+        world_direction /= length
+        rotation = _rotation_matrix(
+            _deg_to_rad(geometry.yaw_deg),
+            _deg_to_rad(geometry.pitch_deg),
+            _deg_to_rad(geometry.roll_deg),
+        )
+        local = rotation.T @ world_direction
+        pan_angle = math.atan2(float(local[0]), float(local[1]))
+        tilt_angle = math.atan2(-float(local[2]), math.hypot(float(local[0]), float(local[1])))
+        pan_scale = _deg_to_rad(geometry.pan_range_deg) / INTERNAL_DMX_MAX
+        tilt_scale = _deg_to_rad(geometry.tilt_range_deg) / INTERNAL_DMX_MAX
+        if pan_scale <= 0 or tilt_scale <= 0:
+            raise ValueError("Pan and tilt ranges must be greater than zero")
 
-        def residual(values):
-            sample = CalibrationSample("target", x_mm, y_mm, int(values[0]), int(values[1]))
-            predicted = _predict_xy(sample, geometry)
-            if predicted is None:
-                return np.array([1000.0, 1000.0])
-            return np.array([(predicted[0] - x_mm) / 1000.0, (predicted[1] - y_mm) / 1000.0])
+        candidates: list[tuple[float, float]] = []
+        angle_branches = [
+            (pan_angle, tilt_angle),
+            (pan_angle + math.pi, math.pi - tilt_angle),
+        ]
+        for base_pan, base_tilt in angle_branches:
+            for pan_turn in range(-3, 4):
+                for tilt_turn in range(-3, 4):
+                    pan = geometry.pan_center + (base_pan + 2 * math.pi * pan_turn) / (geometry.pan_sign * pan_scale)
+                    tilt = geometry.tilt_center + (base_tilt + 2 * math.pi * tilt_turn) / (geometry.tilt_sign * tilt_scale)
+                    if 0 <= pan <= INTERNAL_DMX_MAX and 0 <= tilt <= INTERNAL_DMX_MAX:
+                        candidates.append((pan, tilt))
+        if not candidates:
+            raise ValueError("Target is outside the fitted pan/tilt range")
 
-        start = np.array([geometry.pan_center, geometry.tilt_center], dtype=float)
-        result = least_squares(residual, start, bounds=([0, 0], [65535, 65535]), max_nfev=600)
-        if not result.success:
-            raise ValueError("Could not solve pan/tilt for point")
-        return int(round(result.x[0])), int(round(result.x[1]))
+        pan, tilt = min(
+            candidates,
+            key=lambda values: (values[0] - reference_pan) ** 2 + (values[1] - reference_tilt) ** 2,
+        )
+        return pan, tilt
+
+    def _geometric_residual_correction(self, x_mm: float, y_mm: float) -> tuple[float, float]:
+        ranked: list[tuple[float, float, float]] = []
+        for sample in self.samples:
+            reference_pan = _to_internal_dmx(sample.pan, self.dmx_max)
+            reference_tilt = _to_internal_dmx(sample.tilt, self.dmx_max)
+            try:
+                predicted_pan, predicted_tilt = self._solve_geometric_internal(
+                    sample.x_mm,
+                    sample.y_mm,
+                    reference_pan,
+                    reference_tilt,
+                )
+            except ValueError:
+                continue
+            pan_error = sample.pan - _from_internal_dmx(predicted_pan, self.dmx_max)
+            tilt_error = sample.tilt - _from_internal_dmx(predicted_tilt, self.dmx_max)
+            distance = math.hypot(sample.x_mm - x_mm, sample.y_mm - y_mm)
+            if distance < 1e-6:
+                return float(pan_error), float(tilt_error)
+            ranked.append((distance, float(pan_error), float(tilt_error)))
+
+        if not ranked:
+            return 0.0, 0.0
+        ranked.sort(key=lambda item: item[0])
+        selected = ranked[: min(5, len(ranked))]
+        weights = [1.0 / (distance**2) for distance, _, _ in selected]
+        weight_sum = sum(weights)
+        pan = sum(weight * pan_error for weight, (_, pan_error, _) in zip(weights, selected)) / weight_sum
+        tilt = sum(weight * tilt_error for weight, (_, _, tilt_error) in zip(weights, selected)) / weight_sum
+        return pan, tilt
+
+    def _geometric_reference(self, x_mm: float, y_mm: float) -> tuple[float, float]:
+        if not self.samples:
+            return self.geometry.pan_center, self.geometry.tilt_center
+        pan, tilt = self._idw(x_mm, y_mm)
+        return _to_internal_dmx(pan, self.dmx_max), _to_internal_dmx(tilt, self.dmx_max)
 
     def _idw(self, x_mm: float, y_mm: float, nearest: int = 5, power: float = 2.0) -> tuple[int, int]:
         ranked = []
